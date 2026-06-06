@@ -1,311 +1,254 @@
 import streamlit as st
 from dotenv import load_dotenv
+import os
+import tempfile
+
+# LangChain imports
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
 
-import tempfile
-import os
-import time
+# BM25
+from rank_bm25 import BM25Okapi
 
-# Load environment variables
+# DOCX (IMPORTANT FIX)
+from docx import Document as DocxDocument
+
+# Load env
 load_dotenv()
 
-# Page configuration
-st.set_page_config(
-    page_title="GURU AI",
-    page_icon="🤖",
-    layout="wide"
-)
+# -----------------------------
+# STREAMLIT CONFIG
+# -----------------------------
+st.set_page_config(page_title="GURU AI", page_icon="🤖", layout="wide")
 
-# Modern custom UI
-st.markdown("""
-<style>
+st.title("🤖 GURU AI - Advanced RAG Chatbot")
 
-.main {
-    background-color: #0f172a;
-    color: white;
-}
-
-.stApp {
-    background: linear-gradient(135deg, #0f172a, #111827);
-}
-
-.title {
-    font-size: 48px;
-    font-weight: bold;
-    text-align: center;
-    margin-top: 10px;
-    color: white;
-    animation: fadeIn 1.5s ease-in;
-}
-
-.subtitle {
-    text-align: center;
-    color: #cbd5e1;
-    margin-bottom: 30px;
-}
-
-.chat-box {
-    padding: 15px;
-    border-radius: 15px;
-    margin-bottom: 12px;
-    animation: slideUp 0.4s ease;
-}
-
-.user-box {
-    background-color: #2563eb;
-    color: white;
-}
-
-.ai-box {
-    background-color: #1e293b;
-    color: white;
-}
-
-.upload-box {
-    padding: 20px;
-    border-radius: 15px;
-    background-color: #1e293b;
-    margin-bottom: 20px;
-}
-
-.stTextInput input {
-    border-radius: 12px;
-}
-
-.stButton button {
-    width: 100%;
-    border-radius: 12px;
-    height: 45px;
-    background-color: #2563eb;
-    color: white;
-    font-weight: bold;
-    border: none;
-}
-
-.stButton button:hover {
-    background-color: #1d4ed8;
-}
-
-@keyframes fadeIn {
-    from {
-        opacity: 0;
-    }
-    to {
-        opacity: 1;
-    }
-}
-
-@keyframes slideUp {
-    from {
-        transform: translateY(20px);
-        opacity: 0;
-    }
-    to {
-        transform: translateY(0px);
-        opacity: 1;
-    }
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-# App title
-st.markdown('<div class="title">GURU AI</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">Smart PDF Question Answering Assistant</div>',
-    unsafe_allow_html=True
-)
-
-# Store chat history
+# -----------------------------
+# SESSION STATE
+# -----------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Embedding model
-embedding_model = OpenAIEmbeddings()
+if "bm25" not in st.session_state:
+    st.session_state.bm25 = None
 
-# LLM model
-model = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.3,
-    max_completion_tokens=300
-)
+if "docs" not in st.session_state:
+    st.session_state.docs = None
 
-# Prompt template
+if "vectordb" not in st.session_state:
+    st.session_state.vectordb = None
+
+
+# -----------------------------
+# GUARDRAILS
+# -----------------------------
+def guardrail_check(query):
+    blocked_words = [
+        "ignore previous instructions",
+        "system prompt",
+        "jailbreak",
+        "reveal prompt",
+        "act as system"
+    ]
+    return not any(word in query.lower() for word in blocked_words)
+
+
+# -----------------------------
+# FILE LOADER
+# -----------------------------
+def load_document(file_path, file_type):
+    docs = []
+
+    if file_type == "pdf":
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
+
+    elif file_type == "txt":
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        docs = [Document(page_content=text, metadata={"source": file_path})]
+
+    elif file_type == "docx":
+        doc = DocxDocument(file_path)
+        text = "\n".join([p.text for p in doc.paragraphs])
+        docs = [Document(page_content=text, metadata={"source": file_path})]
+
+    return docs
+
+
+# -----------------------------
+# BM25 BUILD
+# -----------------------------
+def build_bm25(docs):
+    texts = [d.page_content for d in docs]
+    tokenized = [t.lower().split() for t in texts]
+    return BM25Okapi(tokenized)
+
+
+# -----------------------------
+# HYBRID RETRIEVAL (FIXED)
+# -----------------------------
+def hybrid_retrieve(query):
+    retriever = st.session_state.vectordb.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 4, "fetch_k": 10}
+    )
+
+    # FIX: new LangChain API
+    vector_docs = retriever.invoke(query)
+
+    # BM25
+    bm25 = st.session_state.bm25
+    scores = bm25.get_scores(query.lower().split())
+
+    top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:4]
+    bm25_docs = [st.session_state.docs[i] for i in top_idx]
+
+    # merge + deduplicate
+    seen = set()
+    final_docs = []
+
+    for d in vector_docs + bm25_docs:
+        if d.page_content not in seen:
+            final_docs.append(d)
+            seen.add(d.page_content)
+
+    return final_docs[:6]
+
+
+# -----------------------------
+# FORMAT CONTEXT
+# -----------------------------
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
+
+
+# -----------------------------
+# LLM + PROMPT
+# -----------------------------
+model = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+
 prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """
-You are an intelligent AI assistant.
+    ("system", """
+You are a smart AI assistant.
 
-Use ONLY the provided context to answer the user question.
+Rules:
+- Use ONLY the provided context
+- Use chat history if needed
+- If answer not found, say "I don't know based on the document"
+"""),
+    ("human", """
+Chat History:
+{history}
 
-If the answer is not available in the context,
-say:
-"I could not find the answer in the document."
-"""
-    ),
-    (
-        "human",
-        """
 Context:
 {context}
 
 Question:
 {question}
-"""
-    )
+""")
 ])
 
-# Sidebar
-with st.sidebar:
+rag_chain = prompt | model | StrOutputParser()
 
-    st.markdown("## Upload PDF")
+
+# -----------------------------
+# SIDEBAR UPLOAD
+# -----------------------------
+with st.sidebar:
+    st.header("📄 Upload Document")
 
     uploaded_file = st.file_uploader(
-        "Choose a PDF file",
-        type="pdf"
+        "Upload PDF / TXT / DOCX",
+        type=["pdf", "txt", "docx"]
     )
 
-    st.markdown("---")
-    st.markdown("### Features")
-    st.markdown("""
-    - PDF Question Answering
-    - Chat History
-    - LangChain Pipeline
-    - Runnable Architecture
-    """)
+    if uploaded_file:
 
-# Process uploaded PDF
-if uploaded_file:
+        file_type = uploaded_file.name.split(".")[-1]
 
-    with st.spinner("Processing PDF..."):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}") as tmp:
+            tmp.write(uploaded_file.read())
+            file_path = tmp.name
 
-        # Save uploaded PDF temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-            tmp_file.write(uploaded_file.read())
-            pdf_path = tmp_file.name
+        with st.spinner("Processing document..."):
 
-        # Load PDF
-        loader = PyPDFLoader(pdf_path)
-        docs = loader.load()
+            docs = load_document(file_path, file_type)
 
-        # Split documents into chunks
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
-        )
-
-        split_docs = splitter.split_documents(docs)
-
-        # Create vector database
-        vectordb = Chroma.from_documents(
-            documents=split_docs,
-            embedding=embedding_model
-        )
-
-        # Create retriever
-        retriever = vectordb.as_retriever(
-            search_type="mmr",
-            search_kwargs={
-                "k": 4,
-                "fetch_k": 10,
-                "lambda_mult": 0.5
-            }
-        )
-
-        # Function to format retrieved docs
-        def format_docs(docs):
-            return "\n\n".join(
-                doc.page_content for doc in docs
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200
             )
 
-        # Runnable pipeline
-        rag_chain = (
-            {
-                "context": retriever | format_docs,
-                "question": RunnablePassthrough()
-            }
-            | prompt
-            | model
-            | StrOutputParser()
-        )
+            split_docs = splitter.split_documents(docs)
 
-    st.success("PDF processed successfully")
+            embedding = OpenAIEmbeddings()
 
-    # Display chat history
-    for msg in st.session_state.messages:
-
-        if msg["role"] == "user":
-            st.markdown(
-                f"""
-                <div class="chat-box user-box">
-                <b>You:</b><br>{msg["content"]}
-                </div>
-                """,
-                unsafe_allow_html=True
+            vectordb = Chroma.from_documents(
+                documents=split_docs,
+                embedding=embedding
             )
 
-        else:
-            st.markdown(
-                f"""
-                <div class="chat-box ai-box">
-                <b>GURU AI:</b><br>{msg["content"]}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+            bm25 = build_bm25(split_docs)
 
-    # User question input
-    question = st.chat_input("Ask anything from your PDF...")
+            st.session_state.vectordb = vectordb
+            st.session_state.bm25 = bm25
+            st.session_state.docs = split_docs
 
-    # Generate answer
-    if question:
+        st.success("Document processed successfully!")
 
-        # Store user message
-        st.session_state.messages.append({
-            "role": "user",
-            "content": question
+
+# -----------------------------
+# CHAT HISTORY
+# -----------------------------
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+
+
+# -----------------------------
+# INPUT
+# -----------------------------
+question = st.chat_input("Ask anything from your document...")
+
+if question:
+
+    if not guardrail_check(question):
+        st.warning("🚫 Unsafe query detected")
+        st.stop()
+
+    st.session_state.messages.append({
+        "role": "user",
+        "content": question
+    })
+
+    with st.chat_message("user"):
+        st.write(question)
+
+    history = "\n".join(
+        [f"{m['role']}: {m['content']}" for m in st.session_state.messages[-6:]]
+    )
+
+    with st.spinner("Thinking..."):
+
+        docs = hybrid_retrieve(question)
+        context = format_docs(docs)
+
+        response = rag_chain.invoke({
+            "question": question,
+            "context": context,
+            "history": history
         })
 
-        # Show user message instantly
-        st.markdown(
-            f"""
-            <div class="chat-box user-box">
-            <b>You:</b><br>{question}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": response
+    })
 
-        # AI typing animation
-        with st.spinner("GURU AI is thinking..."):
-
-            response = rag_chain.invoke(question)
-
-            time.sleep(1)
-
-        # Store AI response
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": response
-        })
-
-        # Display AI response
-        st.markdown(
-            f"""
-            <div class="chat-box ai-box">
-            <b>GURU AI:</b><br>{response}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-else:
-
-    st.info("Upload a PDF file to start chatting with GURU AI")
+    with st.chat_message("assistant"):
+        st.write(response)

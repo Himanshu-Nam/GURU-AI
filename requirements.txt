@@ -1,7 +1,7 @@
 langchain
 langchain-core
 langchain-community
-
+langchain_chroma
 # LLM Providers
 
 langchain-openai
@@ -50,3 +50,9 @@ streamlit
 
 tqdm
 requests
+
+rank_bm25
+
+python-docx
+
+torchvision
